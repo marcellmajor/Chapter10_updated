@@ -1,0 +1,15 @@
+{
+    "game": "frostbite",
+    "model": "LargeModel",
+    "num_validation_episodes": 10,
+    "num_test_episodes": 32,
+    "population_size": 256,
+    "episode_cutoff_mode": 5000,
+    "timesteps": 5e7,
+    "validation_threshold": 10,
+    "mutation_power": 0.002,
+    "selection_threshold": 20,
+    "num_envs": 64,
+    "noise_table_size": 250000000,
+    "device": "cuda"
+}
