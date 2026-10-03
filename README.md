@@ -10,36 +10,180 @@ been verified on hardware here.** The commands below explicitly check CUDA and e
 the GPU paths before a long run. The Colab configuration is a conservative starting
 point, not a measured optimum or a promise to finish in one session.
 
-## Standalone repository and Colab notebook
+## What the example does
 
-The ready-to-run notebook is [`colab/deep_ga_atari.ipynb`](colab/deep_ga_atari.ipynb).
-Copy the **contents** of this directory into your new repository directory, including
-`.gitignore` and `LICENSE`; omit `.venv/`, `out/`, `__pycache__/`, and `.pytest_cache/`.
-The included license preserves the original source notices. `ga.py`, `requirements.txt`,
-and this README should be at the new repository root.
+Chapter 10, "Deep Neuroevolution", of *Hands-On Neuroevolution with Python* (Iaroslav
+Omelianenko, Packt, 2019) trains an agent to play the Atari 2600 game **Frostbite** from
+screen pixels alone. The controller is a convolutional network with about 4 million
+parameters, found by a genetic algorithm instead of backpropagation. The method is the
+deep GA of Such et al., [Deep Neuroevolution: Genetic Algorithms Are a Competitive
+Alternative for Training Deep Neural Networks for Reinforcement Learning](https://arxiv.org/abs/1712.06567)
+(Uber AI Labs, 2017). The chapter's code builds on Uber's
+[deep-neuroevolution](https://github.com/uber-research/deep-neuroevolution) repository.
 
-Create an empty repository on GitHub, then run these commands in your new local
-directory, replacing the remote URL with yours:
+Gradient-based deep reinforcement learning methods such as DQN and A3C train a network to
+predict values or action probabilities and update it from gradients of a loss. The deep GA
+computes no gradients. It plays the game with many networks, keeps the best scorers, and
+builds the next generation from randomly perturbed copies of them. The only learning
+signal is the game score at the end of each episode.
 
-```bash
-git init -b main
-git add .
-git status --short
-git commit -m "Add modern Chapter 10 Atari GA example"
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
+### The game
+
+In Frostbite, the player jumps between four rows of ice floes drifting over water. Landing
+on a white floe adds a block to an igloo on the shore and changes the floe's color. The
+player must finish the igloo before a 45-second timer freezes them, then enter it to
+clear the level. Faster levels earn larger bonuses, and hazards must be avoided along the
+way. The agent is told none of these rules: it sees only screen frames, and its reward is
+the game score.
+
+### From screen to action
+
+The [Arcade Learning Environment (ALE)](https://ale.farama.org/) emulates the console. For
+each agent step, it repeats the chosen action for 4 frames, max-pools the last two frames
+to remove sprite flicker, converts to grayscale, and resizes to 84×84. The four most recent
+processed frames form the network input. Each episode starts with up to 30 random no-op
+actions, so a policy cannot simply memorize one button sequence for an otherwise
+deterministic game.
+
+The policy is the DQN-style `LargeModel` described in the book, with TensorFlow `SAME`
+padding:
+
+| Layer | Configuration | Output shape |
+|---|---|---|
+| Input | 4 stacked grayscale frames, scaled to [0, 1] | 4×84×84 |
+| Conv 1 | 32 filters, 8×8, stride 4, ReLU | 32×21×21 |
+| Conv 2 | 64 filters, 4×4, stride 2, ReLU | 64×11×11 |
+| Conv 3 | 64 filters, 3×3, stride 1, ReLU | 64×11×11 |
+| Dense | 512 units, ReLU | 512 |
+| Output | One score per action | 18 for Frostbite |
+
+The agent plays the action with the highest score. In total, `LargeModel` has 4,052,658
+weights and biases. The smaller `Model` has 1,008,450 parameters: two convolutional
+layers with 16 and 32 filters and a 256-unit dense layer. It is used by the smoke and
+random-search configurations. The book calls the network a Q-value approximator because
+the architecture comes from DQN. However, the GA never trains the outputs to predict
+returns. Only their argmax matters, and selection sees only episode scores.
+
+### A genome is a list of seeds
+
+Storing every weight would take 16 MB per `LargeModel` individual, so a population of
+1,000 would be expensive to keep and pass around. With Uber's encoding, a genome is
+instead the list of seeds that produced it:
+
+```text
+genome = (τ0, (τ1, σ), (τ2, σ), ..., (τn, σ))
+θ0     = φ(τ0)                  initialization
+θk     = θk-1 + σ · ε(τk)       mutation k, for k = 1..n
 ```
 
-Open Google Colab, choose **File → Open notebook → GitHub**, paste your repository
-URL, and select `colab/deep_ga_atari.ipynb`. Alternatively, upload that notebook file
-directly to Colab. Select a GPU runtime and set `REPO_URL` in the first code cell.
-Run cells individually, in order, starting with setup, GPU diagnostics, tests, and smoke
-training. The notebook supports code either at the repository root or under
-`Chapter10_updated/`; it also has a manually uploaded source option for private repos.
+A seed τ is not given to a random number generator at runtime. It is an offset into a
+fixed table of 250 million Gaussian numbers, generated once from `RandomState(123)`.
+ε(τ) is the slice starting at τ, with one value per parameter. Looking up a slice is much
+faster than sampling millions of new random numbers for every mutation. During
+initialization, φ scales each layer's slice by `std / sqrt(fan_in)` and sets biases to zero.
 
-The notebook clones code onto the VM's local disk and keeps results in
-`MyDrive/chapter10-runs/<RUN_NAME>/`. It starts real training with a 1-million-step
-budget; increase `TOTAL_STEPS` only when ready to continue. Diagnostics include package
+A genome gains one entry per generation of ancestry, regardless of network size. The
+supplied `pretrained/frostbite_uber_elite.json` has 266 entries: 1 initialization and 265
+mutations at σ = 0.002. It decodes into all 4,052,658 parameters. The book's sample run
+printed an elite 26 mutations deep, and `ga.py` logs the current elite's depth each
+generation. Decoding does not replay full chains during training. The parents' weights
+are cached, so building a child costs one table slice and one vector addition.
+
+### One generation of the GA
+
+The steps use `ga_atari_config.json`, the book's configuration. The
+[smaller presets](#configuration-and-resource-sizing) scale these counts down.
+
+1. **Create offspring.** Build `population_size` (1,000) genomes. In the first generation,
+   each is a fresh random initialization. Later, each one picks one of the
+   `selection_threshold` (20) parents uniformly at random and adds one Gaussian mutation
+   with `mutation_power` σ = 0.002. There is no crossover. The network topology is fixed;
+   only the weights evolve.
+2. **Evaluate.** Each genome plays one episode, and the score is its fitness. Training
+   episodes stop after `episode_cutoff_mode`: 5,000 agent steps, or the 20,000 frames
+   given in the book. Up to `num_envs` games run at once, each slot with its own network.
+3. **Validate.** One episode is a noisy estimate. The `validation_threshold` (10) best
+   scorers therefore play `num_validation_episodes` (30) more episodes each. From the
+   second generation, the current elite replaces the tenth candidate and must keep its
+   place. The candidate with the highest validation mean becomes the new elite.
+4. **Test.** The elite plays `num_test_episodes` (200) episodes without the training
+   cutoff; ALE's 108,000-frame episode limit still applies. The test mean only reports
+   progress. It does not affect selection and does not count toward `timesteps`.
+5. **Save.** The snapshot is written. `best.json` is updated when the elite's validation
+   mean is the highest seen so far.
+6. **Select parents.** The 20 genomes with the best training scores become parents. The
+   elite always joins them, replacing the twentieth if needed. Their weights are cached.
+   Training continues until the `timesteps` budget of training plus validation steps
+   (1.5 billion) is reached.
+
+The book describes elitism as copying the elite unchanged into the next generation. In
+the code, the elite instead survives through validation and parent selection. Every
+training genome in a generation is a new mutant. Each generation of this configuration
+plays up to 1,500 episodes: 1,000 training, 300 validation, and 200 test.
+
+### Random-search baseline
+
+`rs_atari_config.json` sets `selection_threshold` to 0. With no parents, every genome in
+every generation is a new random network with a one-seed genome. Validation, elite
+selection, and testing are unchanged. The run reports the best network found by random
+sampling, which shows how much the GA's mutation and selection add. Such et al. use
+this baseline; the book chapter covers only the GA. This configuration uses the smaller
+`Model`; set `"model": "LargeModel"` to match the GA configuration.
+
+### Reading the training output
+
+Each generation prints a table and appends it to `progress.csv`. The main score columns
+are:
+
+| Column | Meaning |
+|---|---|
+| `PopulationEpRewMax`, `PopulationEpRewMean` | Best and mean single-episode training scores in the population |
+| `TruncatedPopulationRewMean` | Mean training score of the validation candidates |
+| `TruncatedPopulationValidationRewMean` | Mean validation score across the candidates |
+| `TruncatedPopulationEliteValidationRew` | New elite's validation mean, used to select it |
+| `TruncatedPopulationEliteIndex` | Elite's position among candidates; after generation 1, 0 means the previous elite was kept |
+| `TruncatedPopulationEliteTestRewMean` | Elite's mean test score, the best estimate of actual performance |
+| `MutationPower` | σ used for this generation's mutations |
+
+`PopulationEpRewMax` is the best of many noisy single episodes, so it is optimistic.
+Validation and test scores are usually lower. In the book's sample run, the population
+maximum was 3,470, the elite's validation mean 3,100, and its 200-episode test mean
+3,060. This port's preprocessing differs from the original
+([details](#fidelity-and-validation)), so its scores need not match. The book's text
+describes some `TruncatedPopulation*` columns differently; the definitions above follow
+the code.
+
+### From the book's code to this port
+
+| Original Chapter 10 code | This port |
+|---|---|
+| `gym_tensorflow` custom TensorFlow op with an `atari-py` fork (`AtariEnv`) | `ale_py.vector_env.AtariVectorEnv` in [`neuroevolution/evaluator.py`](neuroevolution/evaluator.py) |
+| `RLEvalutionWorker` and `ConcurrentWorkers` | `AtariEvaluator.run` and `run_repeated`: a slot scheduler with partial resets |
+| `models/dqn.py` (`Model`, `LargeModel`) | `ARCHITECTURES` and `BatchedPolicy` in [`neuroevolution/models.py`](neuroevolution/models.py) |
+| `models/base.py` (`compute_weights_from_seeds`, `compute_mutation`, `mutate`) | `BatchedPolicy` methods, plus `make_offspring` in [`ga.py`](ga.py) |
+| `SharedNoiseTable` | [`neuroevolution/noise.py`](neuroevolution/noise.py), stored on the training device |
+| `ga.py` experiment runner | [`ga.py`](ga.py), with the same configuration keys plus resume |
+| `display.py`, which opens a game window | [`play.py`](play.py): headless replay with MP4 recording |
+| VINE, plus the `master_extract_parent_ga` and `master_extract_cloud_ga` helpers | Not ported; plot `progress.csv` instead |
+
+The chapter's first exercise, increasing `population_size`, works unchanged. Use a new
+output directory, because resume rejects configuration changes.
+
+## Colab notebook
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/marcellmajor/Chapter10_updated/blob/main/colab/deep_ga_atari.ipynb)
+
+The code is published at
+[github.com/marcellmajor/Chapter10_updated](https://github.com/marcellmajor/Chapter10_updated).
+Open [`colab/deep_ga_atari.ipynb`](colab/deep_ga_atari.ipynb) with the badge above,
+select a GPU runtime, and run the cells individually, in order: setup, GPU diagnostics,
+tests, and smoke training. The repository is public, so no GitHub sign-in or token is
+needed.
+
+The setup cell clones the `main` branch into `/content/Chapter10_updated` on the VM's
+local disk. Rerunning it on the same VM fast-forwards that checkout to the latest pushed
+commit. Results are kept in `MyDrive/chapter10-runs/<RUN_NAME>/`. The notebook starts
+real training with a 1-million-step budget; increase `TOTAL_STEPS` only when ready to continue. Diagnostics include package
 versions, GPU/CPU details, the Git revision, and logs for each command. Share
 `diagnostics/environment.json`, the test summary, and any failing command's output
 when troubleshooting. The notebook structure and Python cells were checked locally;
@@ -52,16 +196,17 @@ The cells below are an alternative manual setup with the source itself stored in
 1. In **Runtime → Change runtime type**, select an available GPU. Colab's GPU models,
    CPU resources, and session limits [vary with availability](https://research.google.com/colaboratory/faq.html).
    High-RAM increases **host** memory, not GPU memory.
-2. Copy `Chapter10_updated/` into `MyDrive/Chapter10_updated/` (omit `.venv/`, caches,
-   and old outputs). Alternatively, clone a repository that contains this updated directory
-   and adjust the working-directory cell below. The original book repository may not
-   contain these updates.
-3. Run these notebook cells in order. Mounting Drive keeps training outputs across VM
-   replacement; a checkpoint is written after each completed generation.
+2. Run these notebook cells in order. The first cell clones the repository into
+   `MyDrive/Chapter10_updated/` if that folder does not exist yet. Mounting Drive keeps
+   training outputs across VM replacement; a checkpoint is written after each completed
+   generation. To get later changes, run
+   `!git -C /content/drive/MyDrive/Chapter10_updated pull --ff-only`. The original book
+   repository does not contain this port.
 
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
+!test -d /content/drive/MyDrive/Chapter10_updated || git clone https://github.com/marcellmajor/Chapter10_updated.git /content/drive/MyDrive/Chapter10_updated
 %cd /content/drive/MyDrive/Chapter10_updated
 ```
 
@@ -256,6 +401,7 @@ Benchmark 32/64/128 slots on the actual VM before scaling further. Tuning ideas 
 ## Local setup
 
 ```bash
+git clone https://github.com/marcellmajor/Chapter10_updated.git
 cd Chapter10_updated
 python3 -m venv .venv
 source .venv/bin/activate
